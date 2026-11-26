@@ -1,0 +1,18 @@
+<Window x:Class="TapRoom.CaseDetailsWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Edit investigation details" Width="580" Height="360" MinHeight="300" MinWidth="440" WindowStartupLocation="CenterOwner" Icon="Assets/TapRoom.ico">
+    <DockPanel Margin="16">
+        <StackPanel DockPanel.Dock="Top">
+            <TextBlock Text="Case reference / ticket (optional)" Margin="0,0,0,4" />
+            <TextBox x:Name="ReferenceBox" MaxLength="250" Height="28" VerticalContentAlignment="Center" Margin="0,0,0,10" />
+            <TextBlock Text="Notes" Margin="0,0,0,4" />
+        </StackPanel>
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+            <TextBlock Text="The capture filename and folder will not change." Foreground="DimGray" Margin="0,0,0,8" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Cancel" IsCancel="True" Width="90" Height="28" Margin="0,0,8,0" />
+                <Button Content="Save" IsDefault="True" Click="Save_Click" Width="90" Height="28" />
+            </StackPanel>
+        </StackPanel>
+        <TextBox x:Name="NotesBox" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" MaxLength="20000" />
+    </DockPanel>
+</Window>
