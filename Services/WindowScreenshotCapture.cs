@@ -20,6 +20,13 @@ internal static class WindowScreenshotCapture
     internal sealed record Target(nint Handle, int Pid, DateTime ProcessStartedUtc, string Title);
     internal sealed record Frame(BitmapSource Image, byte[] Sample, DateTime CapturedUtc);
 
+    // Process-local preference, learned only after a usable frame.
+    private static int _preferStaging;
+    private static int _preferSoftware;
+    internal static bool PreferSoftware => Volatile.Read(ref _preferSoftware) != 0;
+    internal static void RememberDriver(string driver) => Volatile.Write(ref _preferSoftware,
+        driver.StartsWith("WARP", StringComparison.Ordinal) ? 1 : 0);
+
     internal static bool IsSupported => OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041) && GraphicsCaptureSession.IsSupported();
 
     internal static IReadOnlyList<Target> FindWindows(CaptureSession session)
@@ -73,34 +80,47 @@ internal static class WindowScreenshotCapture
         private bool _disposed, _resizing, _received;
         private string? _callbackError;
         private Frame? _lastUsable;
+        private bool _useStaging = Volatile.Read(ref _preferStaging) != 0;
         internal string Driver { get; }
+        internal string Stage { get; private set; } = "Verify window identity";
 
-        internal Source(CaptureSession session, Target target)
+        internal Source(CaptureSession session, Target target, bool forceSoftware = false)
         {
             _target = target;
             _process = Process.GetProcessById(target.Pid);
             IDirect3DDevice? device = null;
             Direct3D11CaptureFramePool? pool = null;
             GraphicsCaptureSession? capture = null;
+            string driver = forceSoftware ? "WARP software D3D11" : "Hardware D3D11";
             try
             {
                 _ = _process.Handle;
                 if (!Verified(session)) throw new InvalidOperationException("Window identity or browser profile changed before capture.");
                 if (!IsSupported) throw new PlatformNotSupportedException("Cursor-free Windows Graphics Capture is unavailable.");
+                Stage = "GraphicsCaptureItem.CreateForWindow";
                 var item = CreateItem(target.Handle);
+                Stage = "GraphicsCaptureItem.Size";
                 _size = item.Size;
                 if (!ValidSize(_size)) throw new InvalidOperationException($"Invalid initial window size {_size.Width}x{_size.Height}.");
-                device = CreateDevice(out var driver);
+                Stage = "Create D3D11 / WinRT graphics device";
+                device = CreateDevice(out driver, forceSoftware);
                 Driver = driver;
+                Stage = "Direct3D11CaptureFramePool.CreateFreeThreaded";
                 pool = Direct3D11CaptureFramePool.CreateFreeThreaded(device, DirectXPixelFormat.B8G8R8A8UIntNormalized, Buffers, _size);
+                Stage = "CreateCaptureSession";
                 capture = pool.CreateCaptureSession(item);
+                Stage = "Disable cursor capture";
                 capture.IsCursorCaptureEnabled = false;
                 _device = device; _pool = pool; _capture = capture;
                 _pool.FrameArrived += FrameArrived;
+                Stage = "GraphicsCaptureSession.StartCapture";
                 _capture.StartCapture();
+                Stage = "Wait for frame";
             }
-            catch
+            catch (Exception ex)
             {
+                ex.Data["TapRoomCaptureStage"] = Stage;
+                ex.Data["TapRoomCaptureDriver"] = driver;
                 if (pool is not null) pool.FrameArrived -= FrameArrived;
                 lock (_sync) { _disposed = true; _latest?.Dispose(); _latest = null; }
                 try { capture?.Dispose(); } catch { }
@@ -162,6 +182,7 @@ internal static class WindowScreenshotCapture
 
         internal async Task<(Frame? Frame, string Detail)> ReadAsync(CaptureSession session, bool manual, CancellationToken ct)
         {
+            Stage = "Verify window identity";
             ct.ThrowIfCancellationRequested();
             if (!Verified(session)) return (null, "Browser window is no longer verified, visible or non-minimised.");
             var timer = Stopwatch.StartNew();
@@ -170,6 +191,7 @@ internal static class WindowScreenshotCapture
             while (timer.Elapsed < timeout)
             {
                 ct.ThrowIfCancellationRequested();
+                Stage = "Wait for frame";
                 var (raw, utc, callbackError) = TakeLatest();
                 if (raw is null)
                 {
@@ -181,6 +203,7 @@ internal static class WindowScreenshotCapture
                 using (raw)
                 {
                     if (!StillMatches(_target, _process)) return (null, "Browser window closed, minimised or changed during acquisition.");
+                    Stage = "Read frame ContentSize";
                     var content = raw.ContentSize;
                     if (!ValidSize(content)) { problem = $"Frame has invalid content size {content.Width}x{content.Height}."; continue; }
                     if (content.Width != _size.Width || content.Height != _size.Height)
@@ -190,28 +213,59 @@ internal static class WindowScreenshotCapture
                     }
                     else
                     {
-                        using var bitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(raw.Surface, BitmapAlphaMode.Ignore);
+                        int stride = checked(content.Width * 4);
+                        byte[] bytes;
+                        string readback;
+                        if (!_useStaging && Volatile.Read(ref _preferStaging) != 0) _useStaging = true;
+                        if (!_useStaging)
+                        {
+                            try
+                            {
+                                Stage = "SoftwareBitmap.CreateCopyFromSurfaceAsync";
+                                using var bitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(raw.Surface, BitmapAlphaMode.Ignore);
+                                ct.ThrowIfCancellationRequested();
+                                if (bitmap.PixelWidth != content.Width || bitmap.PixelHeight != content.Height)
+                                { problem = $"Surface size {bitmap.PixelWidth}x{bitmap.PixelHeight} differs from frame {content.Width}x{content.Height}."; continue; }
+                                Stage = "SoftwareBitmap.Convert";
+                                using var converted = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore);
+                                int length = checked(stride * content.Height);
+                                var buffer = new Windows.Storage.Streams.Buffer((uint)length) { Length = (uint)length };
+                                Stage = "SoftwareBitmap.CopyToBuffer";
+                                converted.CopyToBuffer(buffer);
+                                bytes = new byte[length];
+                                Stage = "DataReader.ReadBytes";
+                                using (var reader = DataReader.FromBuffer(buffer)) reader.ReadBytes(bytes);
+                                readback = "SoftwareBitmap";
+                            }
+                            catch (Exception ex) when (ex.HResult == unchecked((int)0x80004001))
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                _useStaging = true;
+                                bytes = ReadStaging(raw.Surface, content, ct, stage => Stage = stage);
+                                readback = "D3D11 staging (SoftwareBitmap E_NOTIMPL; fallback on same session)";
+                            }
+                        }
+                        else
+                        {
+                            bytes = ReadStaging(raw.Surface, content, ct, stage => Stage = stage);
+                            readback = "D3D11 staging";
+                        }
                         ct.ThrowIfCancellationRequested();
-                        if (bitmap.PixelWidth != content.Width || bitmap.PixelHeight != content.Height)
-                        { problem = $"Surface size {bitmap.PixelWidth}x{bitmap.PixelHeight} differs from frame {content.Width}x{content.Height}."; continue; }
-                        using var converted = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore);
-                        int stride = checked(content.Width * 4), length = checked(stride * content.Height);
-                        var buffer = new Windows.Storage.Streams.Buffer((uint)length) { Length = (uint)length };
-                        converted.CopyToBuffer(buffer);
-                        var bytes = new byte[length];
-                        using (var reader = DataReader.FromBuffer(buffer)) reader.ReadBytes(bytes);
                         var sample = ScreenshotDifference.Sample(bytes, content.Width, content.Height, stride);
                         if (sample.All(b => b <= 3)) { problem = $"Received uniformly black frame ({content.Width}x{content.Height}); not saved."; _lastUsable = null; continue; }
                         if (!StillMatches(_target, _process)) return (null, "Browser window changed during surface copy.");
+                        Stage = "WPF BitmapSource.Create";
                         var image = BitmapSource.Create(content.Width, content.Height, 96, 96, PixelFormats.Bgr32, null, bytes, stride);
                         image.Freeze();
                         _received = true;
+                        if (_useStaging) Volatile.Write(ref _preferStaging, 1);
+                        RememberDriver(Driver);
                         _lastUsable = new(image, sample, utc);
-                        return (_lastUsable, $"Received usable frame {content.Width}x{content.Height}.");
+                        return (_lastUsable, $"Received usable frame {content.Width}x{content.Height}; readback={readback}; driver={Driver}.");
                     }
                 }
                 // Release the acquired frame before resizing the pool.
-                if (newSize is SizeInt32 next) Resize(next);
+                if (newSize is SizeInt32 next) { Stage = "Recreate frame pool"; Resize(next); }
             }
             if (problem is not null) return (null, problem);
             if (_received)
@@ -275,14 +329,14 @@ internal static class WindowScreenshotCapture
         }
     }
 
-    private static IDirect3DDevice CreateDevice(out string driver)
+    private static IDirect3DDevice CreateDevice(out string driver, bool forceSoftware)
     {
-        driver = "Hardware D3D11";
+        driver = forceSoftware ? "WARP software D3D11" : "Hardware D3D11";
         nint d3d = 0, context = 0, dxgi = 0, inspectable = 0;
         try
         {
-            var hr = D3D11CreateDevice(0, 1, 0, 0x20, 0, 0, 7, out d3d, out _, out context);
-            if (hr < 0) // WARP for VMs without a usable hardware adapter
+            var hr = D3D11CreateDevice(0, forceSoftware ? 5u : 1u, 0, 0x20, 0, 0, 7, out d3d, out _, out context);
+            if (hr < 0 && !forceSoftware) // WARP for VMs without a usable hardware adapter
             {
                 if (context != 0) { Marshal.Release(context); context = 0; }
                 if (d3d != 0) { Marshal.Release(d3d); d3d = 0; }
@@ -303,6 +357,108 @@ internal static class WindowScreenshotCapture
             if (d3d != 0) Marshal.Release(d3d);
         }
     }
+
+    // Read the *captured window's* BGRA texture, not the desktop. Native D3D11
+    // staging resources permit CPU reads without SoftwareBitmap's WinRT helper.
+    // Use the texture's own device and immediate context, and honour RowPitch.
+    private static byte[] ReadStaging(IDirect3DSurface surface, SizeInt32 content, CancellationToken ct, Action<string> stage)
+    {
+        nint abi = 0, access = 0, texture = 0, device = 0, context = 0, multithread = 0, staging = 0;
+        bool mapped = false;
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            stage("D3D11 staging: get native surface");
+            abi = WinRT.MarshalInterface<IDirect3DSurface>.FromManaged(surface);
+            if (abi == 0) throw new InvalidOperationException("Windows returned no native surface.");
+            var accessIid = new Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1"); // IDirect3DDxgiInterfaceAccess
+            Marshal.ThrowExceptionForHR(Marshal.QueryInterface(abi, in accessIid, out access));
+            var textureIid = new Guid("6F15AAF2-D208-4E89-9AB4-489535D34F9C"); // ID3D11Texture2D
+            Marshal.ThrowExceptionForHR(Slot<GetInterfaceDelegate>(access, 3)(access, in textureIid, out texture));
+            stage("D3D11 staging: validate texture");
+            Slot<GetTextureDescDelegate>(texture, 10)(texture, out var desc);
+            // DXGI_FORMAT_B8G8R8A8_UNORM = 87; the frame pool explicitly requests it.
+            if (desc.Format != 87 || desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleCount != 1 ||
+                desc.Width < (uint)content.Width || desc.Height < (uint)content.Height ||
+                (ulong)desc.Width * desc.Height > 40_000_000)
+                throw new InvalidOperationException($"Unexpected captured texture {desc.Width}x{desc.Height}, format={desc.Format}, mips={desc.MipLevels}, array={desc.ArraySize}, samples={desc.SampleCount}.");
+            stage("D3D11 staging: get device and context");
+            Slot<GetPointerDelegate>(texture, 3)(texture, out device); // ID3D11DeviceChild.GetDevice
+            Slot<GetPointerDelegate>(device, 40)(device, out context); // ID3D11Device.GetImmediateContext
+            if (context == 0) throw new InvalidOperationException("D3D11 returned no immediate context.");
+            var multiIid = new Guid("9B7E4E00-342C-4106-A19F-4F2704F689F0");
+            Marshal.ThrowExceptionForHR(Marshal.QueryInterface(context, in multiIid, out multithread));
+            // The capture pool is free-threaded; protect the shared immediate context.
+            Slot<SetMultithreadProtectedDelegate>(multithread, 5)(multithread, 1);
+            desc.Usage = 3; // D3D11_USAGE_STAGING
+            desc.BindFlags = 0;
+            desc.CpuAccessFlags = 0x20000; // D3D11_CPU_ACCESS_READ
+            desc.MiscFlags = 0;
+            stage("D3D11 staging: CreateTexture2D");
+            Marshal.ThrowExceptionForHR(Slot<CreateTextureDelegate>(device, 5)(device, in desc, 0, out staging));
+            stage("D3D11 staging: CopyResource");
+            Slot<CopyResourceDelegate>(context, 47)(context, staging, texture);
+            stage("D3D11 staging: Flush");
+            Slot<FlushDelegate>(context, 111)(context); // submit the copy before non-blocking Map
+            stage("D3D11 staging: Map");
+            var timer = Stopwatch.StartNew();
+            MappedResource data;
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                // D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT. Don't block shutdown
+                // indefinitely waiting for a GPU; retry briefly if still drawing.
+                int hr = Slot<MapDelegate>(context, 14)(context, staging, 0, 1, 0x100000, out data);
+                if (hr != unchecked((int)0x887A000A)) { Marshal.ThrowExceptionForHR(hr); mapped = true; break; }
+                if (timer.Elapsed >= TimeSpan.FromSeconds(2)) throw new TimeoutException("GPU staging texture was not ready within two seconds.");
+                Thread.Sleep(10);
+            }
+            stage("D3D11 staging: copy mapped rows");
+            int stride = checked(content.Width * 4);
+            if (data.Data == 0 || data.RowPitch < (uint)stride) throw new InvalidOperationException("Invalid mapped texture pointer or row pitch.");
+            var bytes = new byte[checked(stride * content.Height)];
+            for (int y = 0; y < content.Height; y++)
+            {
+                ct.ThrowIfCancellationRequested();
+                Marshal.Copy(IntPtr.Add(data.Data, checked((int)((long)y * data.RowPitch))), bytes, checked(y * stride), stride);
+            }
+            return bytes;
+        }
+        finally
+        {
+            if (mapped) Slot<UnmapDelegate>(context, 15)(context, staging, 0);
+            if (staging != 0) Marshal.Release(staging);
+            if (multithread != 0) Marshal.Release(multithread);
+            if (context != 0) Marshal.Release(context);
+            if (device != 0) Marshal.Release(device);
+            if (texture != 0) Marshal.Release(texture);
+            if (access != 0) Marshal.Release(access);
+            if (abi != 0) Marshal.Release(abi);
+            GC.KeepAlive(surface);
+        }
+    }
+
+    // COM ABI slots follow the Windows SDK interfaces (including IUnknown and
+    // ID3D11DeviceChild base methods). No unsafe compilation or package required.
+    private static T Slot<T>(nint instance, int slot) where T : Delegate
+    {
+        if (instance == 0) throw new InvalidOperationException("D3D11 returned a null interface.");
+        return Marshal.GetDelegateForFunctionPointer<T>(Marshal.ReadIntPtr(Marshal.ReadIntPtr(instance), checked(slot * IntPtr.Size)));
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct TextureDesc
+    {
+        public uint Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality, Usage, BindFlags, CpuAccessFlags, MiscFlags;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct MappedResource { public nint Data; public uint RowPitch, DepthPitch; }
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate int GetInterfaceDelegate(nint self, in Guid iid, out nint value);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void GetTextureDescDelegate(nint self, out TextureDesc desc);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void GetPointerDelegate(nint self, out nint value);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate int SetMultithreadProtectedDelegate(nint self, int enable);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate int CreateTextureDelegate(nint self, in TextureDesc desc, nint initialData, out nint texture);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void CopyResourceDelegate(nint self, nint destination, nint source);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void FlushDelegate(nint self);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate int MapDelegate(nint self, nint resource, uint subresource, uint mapType, uint flags, out MappedResource data);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void UnmapDelegate(nint self, nint resource, uint subresource);
 
     [StructLayout(LayoutKind.Sequential)] private struct Rect { public int Left, Top, Right, Bottom; }
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate bool EnumWindowsProc(nint hwnd, nint param);

@@ -97,6 +97,9 @@ internal sealed class ScreenshotSession
     private readonly Action<CaptureSession, ScreenshotRecord?, string> _notify;
     private readonly Dictionary<(nint Handle, int Pid, DateTime Started), Baseline> _baselines = new();
     private readonly Dictionary<(nint Handle, int Pid, DateTime Started), WindowScreenshotCapture.Source> _sources = new();
+    // Remember successful WARP capture for this exact window/process identity.
+    private readonly HashSet<(nint Handle, int Pid, DateTime Started)> _softwareWindows = new();
+    private readonly Dictionary<(nint Handle, int Pid, DateTime Started), (DateTime Until, string Detail)> _retryAfter = new();
     private DateTime _lastDiagnosticUtc;
     private bool _prepared;
     private sealed record Baseline(byte[] Sample, int Width, int Height);
@@ -175,6 +178,7 @@ internal sealed class ScreenshotSession
                 Directory.CreateDirectory(folder);
                 if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0) throw new IOException("Refusing to use a linked screenshot folder.");
                 _prepared = true;
+                Log($"Graphics diagnostics (staging readback patch): OS={Environment.OSVersion.VersionString}; session={Environment.GetEnvironmentVariable("SESSIONNAME") ?? "unknown"}; process architecture={System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}.");
                 Log($"Screenshot output: {folder}; automatic={Automatic}; interval={_settings.ScreenshotIntervalSeconds}s; threshold={_settings.ScreenshotChangePercent}%; save initial={_settings.ScreenshotSaveInitial}.");
             }
             if (!WindowScreenshotCapture.IsSupported) throw new PlatformNotSupportedException("Windows Graphics Capture is unavailable (Windows 10 2004+ and a supported graphics session required).");
@@ -187,6 +191,9 @@ internal sealed class ScreenshotSession
                 _sources[key].Dispose(); _sources.Remove(key);
                 Log($"Released window 0x{key.Handle:X} (PID {key.Pid}); no longer eligible.");
             }
+            _softwareWindows.RemoveWhere(k => !live.Contains(k));
+            foreach (var key in _retryAfter.Keys.Where(k => !live.Contains(k) && _retryAfter[k].Until <= DateTime.UtcNow).ToArray())
+                _retryAfter.Remove(key);
             if (windows.Count == 0) return "Waiting for a verified, non-minimised investigation browser window.";
             // Keep a window's baseline through minimisation / temporary invisibility.
             // A PID plus creation time guards against reuse across processes.
@@ -199,24 +206,65 @@ internal sealed class ScreenshotSession
                 ct.ThrowIfCancellationRequested();
                 if (_records.Count >= _settings.ScreenshotMaximum) break;
                 var key = (window.Handle, window.Pid, window.ProcessStartedUtc);
-                WindowScreenshotCapture.Frame? frame;
-                string detail;
-                try
+                if (!manual && _retryAfter.TryGetValue(key, out var retry) && DateTime.UtcNow < retry.Until)
                 {
-                    if (!_sources.TryGetValue(key, out var source))
-                    {
-                        source = new WindowScreenshotCapture.Source(_session, window);
-                        _sources.Add(key, source);
-                        Log($"Started persistent capture for window 0x{window.Handle:X}, PID {window.Pid} ({source.Driver}); cursor disabled.");
-                    }
-                    (frame, detail) = await source.ReadAsync(_session, manual, ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception ex)
-                {
-                    if (_sources.Remove(key, out var failed)) failed.Dispose();
-                    diagnostics.Add($"Window 0x{window.Handle:X}: {ex.GetType().Name} (0x{ex.HResult:X8}): {ex.Message}");
+                    diagnostics.Add($"Window 0x{window.Handle:X}: retry paused until {retry.Until:HH:mm:ss} UTC. {retry.Detail}");
                     continue;
+                }
+                _retryAfter.Remove(key);
+                WindowScreenshotCapture.Frame? frame = null;
+                string detail = "No usable frame.";
+                // After a readback/device failure, try the other driver once,
+                // still using the window-only API and mandatory cursor exclusion.
+                bool? retrySoftware = null;
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    WindowScreenshotCapture.Source? source = null;
+                    bool software = retrySoftware ?? (_softwareWindows.Contains(key) || WindowScreenshotCapture.PreferSoftware);
+                    try
+                    {
+                        if (!_sources.TryGetValue(key, out source))
+                        {
+                            source = new WindowScreenshotCapture.Source(_session, window, software);
+                            _sources.Add(key, source);
+                            Log($"Started persistent capture for window 0x{window.Handle:X}, PID {window.Pid} ({source.Driver}); cursor disabled.");
+                        }
+                        (frame, detail) = await source.ReadAsync(_session, manual, ct).ConfigureAwait(false);
+                        if (frame is not null)
+                        {
+                            if (source.Driver.StartsWith("WARP", StringComparison.Ordinal)) _softwareWindows.Add(key);
+                            else _softwareWindows.Remove(key);
+                        }
+                        break;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        var stage = ex.Data["TapRoomCaptureStage"] as string ?? source?.Stage ?? "Unknown graphics stage";
+                        var driver = ex.Data["TapRoomCaptureDriver"] as string ?? source?.Driver ?? (software ? "WARP software D3D11" : "Hardware D3D11");
+                        if (_sources.Remove(key, out var failed)) failed.Dispose();
+                        detail = $"{stage} ({driver}): {ex.GetType().Name} (0x{ex.HResult:X8}): {ex.Message}";
+                        bool deviceDependent = stage is not ("GraphicsCaptureItem.CreateForWindow" or "GraphicsCaptureItem.Size" or "Disable cursor capture" or "Verify window identity");
+                        bool graphicsFailure = ex.HResult == unchecked((int)0x80004001) ||
+                            stage.StartsWith("D3D11 staging:", StringComparison.Ordinal) ||
+                            ex.HResult == unchecked((int)0x887A0004) || ex.HResult == unchecked((int)0x887A0005) ||
+                            ex.HResult == unchecked((int)0x887A0006) || ex.HResult == unchecked((int)0x887A0007);
+                        bool actualSoftware = driver.StartsWith("WARP", StringComparison.Ordinal);
+                        // If hardware creation already fell back to WARP, both have been tried.
+                        if (attempt == 0 && deviceDependent && graphicsFailure && (!actualSoftware || software))
+                        {
+                            retrySoftware = !actualSoftware;
+                            Log($"Window 0x{window.Handle:X}: {detail}; retrying with {(retrySoftware.Value ? "WARP software D3D11" : "hardware D3D11")}.");
+                            continue;
+                        }
+                        // A persistent API failure must not recreate a capture session every second.
+                        // Manual capture may retry immediately. Do not interrupt traffic capture.
+                        var until = DateTime.UtcNow.AddSeconds(30);
+                        _retryAfter[key] = (until, detail);
+                        Log($"Window 0x{window.Handle:X}: {detail}; automatic retry in 30 seconds.");
+                        break;
+                    }
                 }
                 if (frame is null) { diagnostics.Add($"Window 0x{window.Handle:X}: {detail}"); continue; }
                 valid++;
